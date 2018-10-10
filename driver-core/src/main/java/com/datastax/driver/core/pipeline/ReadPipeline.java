@@ -1,95 +1,156 @@
 package com.datastax.driver.core.pipeline;
 
-import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.ResultSetFuture;
-import com.datastax.driver.core.Session;
-import com.datastax.driver.core.Statement;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.LinkedList;
-import java.util.Queue;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.Iterator;
 
-public class WritePipeline extends Pipeline {
-    private static final Logger logger = LoggerFactory.getLogger(Cluster.class);
+/**
+ * The ``ReadPipeline`` is a helper object meant to add high-performance
+ * read request pipelining to any application with minimal code changes.
+ *
+ * A `Session` object is first created and used
+ * to initiate the ``ReadPipeline``. The ``ReadPipeline`` can then be
+ * used to execute multiple queries asynchronously using
+ * `Pipeline.execute()`.
+ *
+ * As `Pipeline.maxInFlightRequests` is reached,
+ * statements are queued up for execution as soon as a
+ * `ResponseSetFuture` is returned.
+ *
+ * Once all requests have been sent into the ``ReadPipeline`` and the
+ * business logic requires consuming those read requests,
+ * `ReadPipeline.results()` will return an iterator
+ * of `ResponseSetFuture` objects.
+ *
+ * The result from `ReadPipeline.results().get()` is an
+ * iterator of `ResultSet` objects which in turn
+ * another iterator over the result's rows and the same type of object
+ * returned when calling `Session.execute()`.
+ *
+ * The results from `ReadPipeline.results()` follow
+ * the same ordering as statements that went into
+ * `Pipeline.execute()` without any top-level
+ * indication of the keyspace, table, nor query that was called that is not
+ * already accessible within the `ResultSet`.
+ *
+ * It's recommended to keep a dedicated readPipeline for each query unless
+ * schemas are identical or business logic will handle the different types of
+ * returned Cassandra rows.
+ *
+ * `Pipeline.execute()` passes the `Statement`
+ * `Session.execute_async()`
+ * internally to increase familiarity with standard java-driver usage.
+ * By default, `PreparedStatement` queries will be
+ * processed as expected.
+ *
+ * If `SimpleStatement`, `BoundStatement`,
+ * and `BatchStatement` statements need to be processed,
+ * `Pipeline.allowNonPerformantQueries` will
+ * need to be set to `True`. `BatchStatements`
+ * should only be used if all statements will modify the same partition to
+ * avoid Cassandra anti-patterns.
+ *
+ * Example usage::
+ *
+ * >>> from cassandra.cluster import Cluster
+ * >>> from cassandra.concurrent import ReadPipeline
+ * >>> cluster = Cluster(['192.168.1.1', '192.168.1.2'])
+ * >>> session = cluster.connect()
+ * >>> read_pipeline = ReadPipeline(session)
+ * >>> prepared_statement = session.prepare('SELECT * FROM mykeyspace.users WHERE name = ?')
+ * >>> read_pipeline.execute(prepared_statement, ('Jorge'))
+ * >>> read_pipeline.execute(prepared_statement, ('Jose'))
+ * >>> read_pipeline.execute(prepared_statement, ('Sara'))
+ * >>> prepared_statement = session.prepare('SELECT * FROM old_keyspace.old_users WHERE name = ?')
+ * >>> read_pipeline.execute(prepared_statement, ('Jorge'))
+ * >>> read_pipeline.execute(prepared_statement, ('Jose'))
+ * >>> read_pipeline.execute(prepared_statement, ('Sara'))
+ * >>> for result in read_pipeline.results():
+ * ...     for row in result:
+ * ...         print row.name, row.age
+ * >>> ...
+ * >>> cluster.shutdown()
+ */
+public class ReadPipeline extends Pipeline {
+    private static final Logger logger = LoggerFactory.getLogger(ReadPipeline.class);
 
-    private WritePipeline(Builder builder) {
+    ReadPipeline(Builder builder) {
         super(builder);
     }
 
+    /**
+     * This method is only for the WritePipeline since it only ensures
+     * the requests were processed correctly. For ReadPipelines we will
+     * want to consume those requests.
+     */
     @Override
-    public void confirm() {
-        try {
-            completedRequests.acquire();
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
+    void confirm() {
+        throw new UnsupportedOperationException();
     }
 
-    public class Builder {
-        // the Cassandra session object
-        protected Session session;
+    /**
+     * Iterate over and return all read request `future.results()`.
+     *
+     * @return An iterator of Cassandra `ResultSetFuture` objects, which in
+     * turn are iterators over ResultSet rows from a query result.
+     */
+    Iterator<ResultSetFuture> results() {
+        return new ResultIterator(this);
+    }
 
-        // set max_in_flight_requests
-        protected int maxInFlightRequests = 100;
+    class ResultIterator implements Iterator {
+        ReadPipeline pipeline;
 
-        // set the maximum number of unsent write requests before the Pipeline
-        // blocks to ensure that all in-flight write requests have been
-        // processed and confirmed to not have thrown any exceptions.
-        // ignore the maximum size of pending statements if set to None/0/False
-        protected int maxUnsentWriteRequests = 40000;
-
-        // set the maximum number of unconsumed futures to hold onto
-        // before continuing to process more pending read requests
-        protected int maxUnconsumedReadResponses = 0;
-
-        // use a custom errorHandler function upon future.result() errors
-        protected Class errorHandler = null;
-
-        // allow for Statements, BoundStatements, and BatchStatements to be
-        // processed. By default, only PreparedStatements are processed.
-        protected boolean allowNonPerformantQueries = false;
-
-        public Builder(Session session) {
-            this.session = session;
+        /**
+         * Iterates over a `ReadPipeline` object to consume all results
+         * in the order they were received.
+         *
+         * @param readPipeline
+         */
+        public ResultIterator(ReadPipeline readPipeline) {
+            pipeline = readPipeline;
         }
 
-        public Builder maxInFlightRequests(int maxInFlightRequests) {
-            this.maxInFlightRequests = maxInFlightRequests;
-            return this;
+        /**
+         * Checks the ReadPipeline to see if all pending futures and statements
+         * have been processed.
+         *
+         * @return `True` when there are still more results to consume.
+         * `False` when there are no more results to consume.
+         */
+        @Override
+        public boolean hasNext() {
+            return pipeline.completedRequests.availablePermits() < 0;
         }
 
-        public Builder maxUnsentWriteRequests(int maxUnsentWriteRequests) {
-            this.maxUnsentWriteRequests = maxUnsentWriteRequests;
-            return this;
+        /**
+         * Iterates over unconsumed Cassandra read requests and delivers
+         * ResultSetFuture objects which should be consumed via `future.get()`.
+         *
+         * @return In order Cassandra read request futures.
+         */
+        @Override
+        public ResultSetFuture next() {
+            ResultSetFuture future = pipeline.futures.remove();
+
+            // always ensure that at least one future has been queued.
+            // useful for cases where `maxUnconsumedReadResponses == 0`
+            pipeline.maximizeInFlightRequests();
+
+            // yield the ResultSetFuture which in turn is another iterator over
+            // the rows within the query's result
+            return future;
         }
 
-        public Builder maxUnconsumedReadResponses(int maxUnconsumedReadResponses) {
-            this.maxUnconsumedReadResponses = maxUnconsumedReadResponses;
-            return this;
-        }
-
-        public Builder errorHandler(Class errorHandler) {
-            this.errorHandler = errorHandler;
-            return this;
-        }
-
-        public Builder allowNonPerformantQueries(boolean allowNonPerformantQueries) {
-            this.allowNonPerformantQueries = allowNonPerformantQueries;
-            return this;
-        }
-
-        public WritePipeline build() {
-            // ensure that we are not using settings for the ReadPipeline within
-            // the WritePipeline, or vice versa
-            if (this.maxUnsentWriteRequests > 0 && this.maxUnconsumedReadResponses > 0) {
-                throw new IllegalArgumentException("The pipeline can either be a Read or Write Pipeline, not both." +
-                        " As such, maxUnsentWriteRequests and maxUnconsumedReadResponses cannot both be non-zero.");
-            }
-            return new WritePipeline(this);
+        /**
+         * The `remove()` method is not supported since all Cassandra
+         * futures are meant for application consumption.
+         */
+        @Override
+        public void remove() {
+            throw new UnsupportedOperationException();
         }
     }
 }

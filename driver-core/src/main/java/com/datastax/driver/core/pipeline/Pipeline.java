@@ -1,5 +1,6 @@
-package com.datastax.driver.core;
+package com.datastax.driver.core.pipeline;
 
+import com.datastax.driver.core.*;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import org.slf4j.Logger;
@@ -12,11 +13,16 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+/**
+ * This ``Pipeline`` object is not meant to be used by itself and instead
+ * should be used via the `pipeline.WritePipeline` or
+ * `pipeline.ReadPipeline` objects.
+ *
+ * This ``Pipeline`` object is missing fundamental functionality to ensure
+ * write requests are processed or read requests are able to be read.
+ */
 abstract public class Pipeline {
-    private static final Logger logger = LoggerFactory.getLogger(Cluster.class);
-
-    class ResultSentinel {
-    }
+    private static final Logger logger = LoggerFactory.getLogger(Pipeline.class);
 
     // the Cassandra session object
     private final Session session;
@@ -35,20 +41,20 @@ abstract public class Pipeline {
     private final int maxUnconsumedReadResponses;
 
     // use a custom errorHandler function upon future.result() errors
-    private final Class errorHandler;
+    private final PipelineErrorHandler errorHandler;
 
     // allow for Statements, BoundStatements, and BatchStatements to be
     // processed. By default, only PreparedStatements are processed.
     private final boolean allowNonPerformantQueries;
 
     // hold futures for the ReadPipeline superclass
-    private final Queue<ResultSetFuture> futures = new LinkedList<ResultSetFuture>();
+    final Queue<ResultSetFuture> futures = new LinkedList<ResultSetFuture>();
 
     // store all pending PreparedStatements along with matching args/kwargs
     private final Queue<Statement> statements = new LinkedList<Statement>();
 
     // track when all pending statements and futures have returned
-    private final Semaphore completedRequests = new Semaphore(1);
+    final Semaphore completedRequests = new Semaphore(1);
 
     // track the number of in-flight futures and completed statements
     // always to be used with an in_flight_counter_lock
@@ -59,7 +65,7 @@ abstract public class Pipeline {
     // 2. creating the last future
     private final Lock inFlightCounterLock = new ReentrantLock();
 
-    private Pipeline(Builder builder) {
+    Pipeline(Builder builder) {
         session = builder.session;
         maxInFlightRequests = builder.maxInFlightRequests;
         maxUnsentWriteRequests = builder.maxUnsentWriteRequests;
@@ -68,7 +74,27 @@ abstract public class Pipeline {
         allowNonPerformantQueries = builder.allowNonPerformantQueries;
     }
 
-    private void maximizeInFlightRequests() {
+    /**
+     * This code is called multiple times within the Pipeline infrastructure
+     * to ensure we're keeping as many in-flight requests processing as
+     * possible.
+     *
+     * We're cautious here and default to a no-op in cases where:
+     *
+     * * There are already too many in-flight requests.
+     * * We already have too many `ResultSetFuture`
+     *   objects taking up memory.
+     * * There are no more statements that need to be processed.
+     *
+     * In all other cases, we call
+     * `Session.execute_async()` with a queued
+     * Statement, and add a callback to the future.
+     *
+     * In cases where we're using a `ReadPipeline`, we will store the future
+     * for later consumption of the `ResultSetFuture`
+     * objects by way of `ReadPipeline.results()`.
+     */
+    void maximizeInFlightRequests() {
         // convert pending statements to in-flight futures if we haven't hit our
         // threshold
         if (this.inFlightCounter > this.maxInFlightRequests) {
@@ -113,12 +139,27 @@ abstract public class Pipeline {
             Futures.addCallback(future, new FutureCallback<ResultSet>() {
                 @Override
                 public void onSuccess(ResultSet rows) {
-                    // TODO
+                    inFlightCounterLock.lock();
+                    try {
+                        // keep track of the number of in-flight requests
+                        --inFlightCounter;
+                        if (inFlightCounter < 1) {
+                            if (statements.isEmpty()) {
+                                if (inFlightCounter < 0) {
+                                    throw new RuntimeException("The in_flight_counter should never have been less" +
+                                            " than 0. The lock mechanism is not working as expected!");
+                                }
+                            }
+                        }
+                        maximizeInFlightRequests();
+                    } finally {
+                        inFlightCounterLock.unlock();
+                    }
                 }
 
                 @Override
                 public void onFailure(Throwable throwable) {
-                    // TODO
+                    errorHandler.handle(throwable);
                 }
             });
         }
@@ -153,38 +194,31 @@ abstract public class Pipeline {
         this.maximizeInFlightRequests();
     }
 
-    public void confirm() {
-        try {
-            completedRequests.acquire();
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
-    }
-
+    abstract void confirm();
 
     public class Builder {
         // the Cassandra session object
-        protected Session session;
+        private Session session;
 
         // set max_in_flight_requests
-        protected int maxInFlightRequests = 100;
+        private int maxInFlightRequests = 100;
 
         // set the maximum number of unsent write requests before the Pipeline
         // blocks to ensure that all in-flight write requests have been
         // processed and confirmed to not have thrown any exceptions.
         // ignore the maximum size of pending statements if set to None/0/False
-        protected int maxUnsentWriteRequests = 40000;
+        private int maxUnsentWriteRequests = 40000;
 
         // set the maximum number of unconsumed futures to hold onto
         // before continuing to process more pending read requests
-        protected int maxUnconsumedReadResponses = 0;
+        private int maxUnconsumedReadResponses = 0;
 
         // use a custom errorHandler function upon future.result() errors
-        protected Class errorHandler = null;
+        private PipelineErrorHandler errorHandler = null;
 
         // allow for Statements, BoundStatements, and BatchStatements to be
         // processed. By default, only PreparedStatements are processed.
-        protected boolean allowNonPerformantQueries = false;
+        private boolean allowNonPerformantQueries = false;
 
         public Builder(Session session) {
             this.session = session;
@@ -196,16 +230,28 @@ abstract public class Pipeline {
         }
 
         public Builder maxUnsentWriteRequests(int maxUnsentWriteRequests) {
+            // ensure that we are not using settings for the ReadPipeline within
+            // the WritePipeline, or vice versa
+            if (this.maxUnsentWriteRequests > 0 && this.maxUnconsumedReadResponses > 0) {
+                throw new IllegalArgumentException("The pipeline can either be a Read or Write Pipeline, not both." +
+                        " As such, maxUnsentWriteRequests and maxUnconsumedReadResponses cannot both be non-zero.");
+            }
             this.maxUnsentWriteRequests = maxUnsentWriteRequests;
             return this;
         }
 
         public Builder maxUnconsumedReadResponses(int maxUnconsumedReadResponses) {
+            // ensure that we are not using settings for the ReadPipeline within
+            // the WritePipeline, or vice versa
+            if (this.maxUnsentWriteRequests > 0 && this.maxUnconsumedReadResponses > 0) {
+                throw new IllegalArgumentException("The pipeline can either be a Read or Write Pipeline, not both." +
+                        " As such, maxUnsentWriteRequests and maxUnconsumedReadResponses cannot both be non-zero.");
+            }
             this.maxUnconsumedReadResponses = maxUnconsumedReadResponses;
             return this;
         }
 
-        public Builder errorHandler(Class errorHandler) {
+        public Builder errorHandler(PipelineErrorHandler errorHandler) {
             this.errorHandler = errorHandler;
             return this;
         }
@@ -215,66 +261,13 @@ abstract public class Pipeline {
             return this;
         }
 
-        public Pipeline build() {
-            // ensure that we are not using settings for the ReadPipeline within
-            // the WritePipeline, or vice versa
-            if (this.maxUnsentWriteRequests > 0 && this.maxUnconsumedReadResponses > 0) {
-                throw new IllegalArgumentException("The pipeline can either be a Read or Write Pipeline, not both." +
-                        " As such, maxUnsentWriteRequests and maxUnconsumedReadResponses cannot both be non-zero.");
-            }
-            return new Pipeline(this);
+        public WritePipeline buildWritePipeline() {
+            return new WritePipeline(this);
+        }
+
+        public ReadPipeline buildReadPipeline() {
+            return new ReadPipeline(this);
         }
     }
 }
 
-public class WritePipeline {
-    private static final Logger logger = LoggerFactory.getLogger(Cluster.class);
-
-    class ResultSentinel {
-    }
-
-    // the Cassandra session object
-    private final Session session;
-
-    // set max_in_flight_requests
-    private final int maxInFlightRequests;
-
-    // set the maximum number of unsent write requests before the Pipeline
-    // blocks to ensure that all in-flight write requests have been
-    // processed and confirmed to not have thrown any exceptions.
-    // ignore the maximum size of pending statements if set to None/0/False
-    private final int maxUnsentWriteRequests;
-
-    // use a custom errorHandler function upon future.result() errors
-    private final Class errorHandler;
-
-    // allow for Statements, BoundStatements, and BatchStatements to be
-    // processed. By default, only PreparedStatements are processed.
-    private final boolean allowNonPerformantQueries;
-
-    // hold futures for the ReadPipeline superclass
-    private final Queue<ResultSetFuture> futures = new LinkedList<ResultSetFuture>();
-
-    // store all pending PreparedStatements along with matching args/kwargs
-    private final Queue<Statement> statements = new LinkedList<Statement>();
-
-    // track when all pending statements and futures have returned
-    private final Semaphore completedRequests = new Semaphore(1);
-
-    // track the number of in-flight futures and completed statements
-    // always to be used with an in_flight_counter_lock
-    private int inFlightCounter = 0;
-
-    // ensure that this.completed_requests will never be set() between:
-    // 1. emptying the this.statements
-    // 2. creating the last future
-    private final Lock inFlightCounterLock = new ReentrantLock();
-
-    private WritePipeline(Pipeline.Builder builder) {
-        session = builder.session;
-        maxInFlightRequests = builder.maxInFlightRequests;
-        maxUnsentWriteRequests = builder.maxUnsentWriteRequests;
-        errorHandler = builder.errorHandler;
-        allowNonPerformantQueries = builder.allowNonPerformantQueries;
-    }
-}
